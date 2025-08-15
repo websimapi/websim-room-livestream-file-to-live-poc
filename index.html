@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Room Livestream (File-to-Live POC)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="dot"></div>
+      <span>Room Livestream</span>
+    </div>
+    <div class="peers" id="peers"></div>
+  </header>
+
+  <main class="wrap">
+    <section class="left">
+      <div class="video-shell">
+        <video id="video" playsinline crossorigin="anonymous"></video>
+
+        <div class="overlay hidden" id="joinOverlay">
+          <div class="card">
+            <h2>Tap to Join Live</h2>
+            <p>Autoplay was blocked by your browser. Press the button to start watching.</p>
+            <button id="joinBtn" class="primary">Join Live</button>
+          </div>
+        </div>
+
+        <div class="badge" id="liveBadge">OFF AIR</div>
+        <div class="meta">
+          <div class="title" id="streamTitle">No stream active</div>
+          <div class="host" id="hostInfo">Host: —</div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <input type="file" id="fileInput" accept="video/*" />
+        <button id="goLiveBtn" class="primary">Go Live</button>
+        <button id="takeHostBtn">Take Host</button>
+        <button id="endBtn" class="danger">End</button>
+      </div>
+
+      <div class="tips">
+        <p>
+          As a proof-of-concept, the "host" uploads a video file. It’s stored and shared by URL,
+          then all viewers synchronize playback in real-time.
+        </p>
+        <ul>
+          <li>Only the host controls play/pause and seeking.</li>
+          <li>Late joiners automatically catch up to the live moment.</li>
+          <li>Click "Take Host" to become host if the current host leaves.</li>
+        </ul>
+      </div>
+    </section>
+
+    <aside class="right">
+      <div class="panel">
+        <h3>Room</h3>
+        <div class="row">
+          <span>Status</span>
+          <strong id="roomStatus">Connecting…</strong>
+        </div>
+        <div class="row">
+          <span>You</span>
+          <strong id="youLabel">—</strong>
+        </div>
+        <div class="divider"></div>
+        <h3>Diagnostics</h3>
+        <div class="mono small" id="diag"></div>
+      </div>
+    </aside>
+  </main>
+
+  <script type="module" src="./main.js"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
+
