@@ -43,6 +43,11 @@ let appendQueue = [];
 let appending = false;
 let chunkPollTimer = null;
 let chunkModeInitialized = false;
+/* new: track MSE ObjectURL and stall watchdog */
+let mseObjUrl = null;
+let stallTimer = null;
+let lastTimeSample = 0;
+let lastProgressAt = 0;
 
 function getLivestream() {
   return room.roomState.livestream || null;
@@ -141,6 +146,8 @@ function teardownMSE() {
   if (mse) {
     try { mse.endOfStream(); } catch {}
   }
+  if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
+  if (mseObjUrl) { try { URL.revokeObjectURL(mseObjUrl); } catch {} mseObjUrl = null; }
   mse = null;
   sourceBuffer = null;
   mseReady = false;
@@ -164,6 +171,7 @@ function ensureMSE(ls) {
   els.video.removeAttribute('src'); // fully reset before attaching
   els.video.load();
   const objUrl = URL.createObjectURL(mse);
+  mseObjUrl = objUrl;
   els.video.src = objUrl;
   mse.addEventListener('sourceopen', () => {
     try {
@@ -176,12 +184,15 @@ function ensureMSE(ls) {
       sourceBuffer = mse.addSourceBuffer(mime);
       mse.duration = Infinity;
       sourceBuffer.mode = 'segments';
-      sourceBuffer.addEventListener('updateend', tryDequeue);
+      // on updateend: dequeue next and trim old buffered data
+      sourceBuffer.addEventListener('updateend', () => { tryDequeue(); trimOldBuffer(30); });
       sourceBuffer.addEventListener('error', () => handleMediaError());
       mseReady = true;
       mseInitInProgress = false;
       // Start polling room state for new chunks
       chunkPollTimer = setInterval(() => appendAvailableChunks(ls), 500);
+      // Start stall recovery watchdog
+      stallTimer = setInterval(maybeRecoverStall, 1000);
     } catch (e) {
       mseInitInProgress = false;
       logDiag('MSE init failed. ' + e.message);
@@ -212,19 +223,36 @@ function tryDequeue() {
   }
 }
 
+/* trim old buffered data to avoid unbounded growth (~30s) */
+function trimOldBuffer(maxSec = 30) {
+  if (!sourceBuffer) return;
+  const buf = els.video.buffered;
+  if (!buf || buf.length === 0) return;
+  const end = buf.end(buf.length - 1);
+  const removeEnd = end - maxSec;
+  if (removeEnd <= 0) return;
+  if (!sourceBuffer.updating) {
+    try { sourceBuffer.remove(0, removeEnd); } catch {}
+  }
+}
+
 async function appendAvailableChunks(ls) {
   if (!mseReady || !mse || mse.readyState !== 'open' || !sourceBuffer) return;
   if (els.video.error) { handleMediaError(); return; }
   const cur = room.roomState.livestream; // latest
   if (!cur || cur.mode !== 'chunk' || !cur.chunks) return;
-  // append in order while next seq exists
+  // if we're too far behind, skip ahead to near-live to avoid backlog stalls
+  if (typeof cur.latestSeq === 'number' && cur.latestSeq - expectSeq > 10) {
+    expectSeq = Math.max(0, cur.latestSeq - 3);
+    logDiag('Skipping ahead to near-live to recover.');
+  }
   while (cur.chunks[String(expectSeq)]) {
     const meta = cur.chunks[String(expectSeq)];
     try {
       const ab = await fetchChunk(meta.url);
       queueAppend(ab);
       expectSeq++;
-      if (els.video.paused && !ls.paused) {
+      if (els.video.paused && !cur.paused) {
         els.video.play().catch(() => {
           els.joinOverlay.classList.remove('hidden');
         });
@@ -244,14 +272,38 @@ function handleMediaError() {
   const ls = getLivestream();
   if (!ls || ls.mode !== 'chunk') return;
   const now = Date.now();
-  // simple backoff to prevent thrash
   if (now - lastMSEErrorAt < 1000) return;
   lastMSEErrorAt = now;
   const resumeFrom = (ls.latestSeq || 0);
   teardownMSE();
   expectSeq = resumeFrom;
-  // give the element a moment to clear its error state
   setTimeout(() => ensureMSE(ls), 250);
+}
+
+/* recover from stalls by jumping to buffered end */
+function maybeRecoverStall() {
+  const ls = room.roomState.livestream;
+  if (!ls || ls.mode !== 'chunk' || ls.paused) return;
+  if (!els.video || els.video.paused) return;
+  const buf = els.video.buffered;
+  const now = performance.now();
+  const ct = els.video.currentTime;
+  if (ct !== lastTimeSample) {
+    lastTimeSample = ct;
+    lastProgressAt = now;
+  }
+  const noProgressMs = now - lastProgressAt;
+  const lowReady = els.video.readyState < 3;
+  if (buf && buf.length) {
+    const end = buf.end(buf.length - 1);
+    const behind = end - ct;
+    if ((lowReady || noProgressMs > 2000) && behind > 0.2) {
+      try { els.video.currentTime = end - 0.1; } catch {}
+      els.video.play().catch(() => { els.joinOverlay.classList.remove('hidden'); });
+      lastProgressAt = now;
+      logDiag('Stall detected: jumped to live edge.');
+    }
+  }
 }
 
 // Sync local video element to room state
