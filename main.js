@@ -37,6 +37,12 @@ let mseReady = false;
 /* add guards to avoid rapid reinit loops */
 let mseInitInProgress = false;
 let lastMSEErrorAt = 0;
+/* new: chunk pipeline state */
+let expectSeq = 0;
+let appendQueue = [];
+let appending = false;
+let chunkPollTimer = null;
+let chunkModeInitialized = false;
 
 function getLivestream() {
   return room.roomState.livestream || null;
