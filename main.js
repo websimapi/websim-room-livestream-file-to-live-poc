@@ -34,11 +34,9 @@ const state = {
 let mse = null;
 let sourceBuffer = null;
 let mseReady = false;
-let expectSeq = 0;
-let appendQueue = [];
-let appending = false;
-let chunkPollTimer = null;
-let chunkModeInitialized = false;
+/* add guards to avoid rapid reinit loops */
+let mseInitInProgress = false;
+let lastMSEErrorAt = 0;
 
 function getLivestream() {
   return room.roomState.livestream || null;
@@ -140,6 +138,7 @@ function teardownMSE() {
   mse = null;
   sourceBuffer = null;
   mseReady = false;
+  mseInitInProgress = false;
   expectSeq = 0;
   appendQueue = [];
   appending = false;
@@ -152,21 +151,33 @@ function teardownMSE() {
 }
 
 function ensureMSE(ls) {
-  if (chunkModeInitialized) return;
+  if (chunkModeInitialized || mseInitInProgress) return;
+  mseInitInProgress = true;
   teardownMSE(); // reset before init
   mse = new MediaSource();
-  els.video.src = URL.createObjectURL(mse);
+  els.video.removeAttribute('src'); // fully reset before attaching
+  els.video.load();
+  const objUrl = URL.createObjectURL(mse);
+  els.video.src = objUrl;
   mse.addEventListener('sourceopen', () => {
     try {
-      sourceBuffer = mse.addSourceBuffer(ls.mime || 'video/webm; codecs=vp8,opus');
+      // pick a supported mime (prefer room state, else fallback)
+      let mime = ls.mime || 'video/webm; codecs=vp8,opus';
+      if (!MediaSource.isTypeSupported(mime)) {
+        const fallbacks = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
+        mime = fallbacks.find(m => MediaSource.isTypeSupported(m)) || 'video/webm';
+      }
+      sourceBuffer = mse.addSourceBuffer(mime);
       mse.duration = Infinity;
       sourceBuffer.mode = 'segments';
       sourceBuffer.addEventListener('updateend', tryDequeue);
       sourceBuffer.addEventListener('error', () => handleMediaError());
       mseReady = true;
+      mseInitInProgress = false;
       // Start polling room state for new chunks
       chunkPollTimer = setInterval(() => appendAvailableChunks(ls), 500);
     } catch (e) {
+      mseInitInProgress = false;
       logDiag('MSE init failed. ' + e.message);
     }
   });
@@ -185,7 +196,7 @@ function queueAppend(buf) {
 }
 
 function tryDequeue() {
-  if (!sourceBuffer || sourceBuffer.updating || !appendQueue.length) return;
+  if (!sourceBuffer || !mse || mse.readyState !== 'open' || sourceBuffer.updating || !appendQueue.length) return;
   const buf = appendQueue.shift();
   try {
     sourceBuffer.appendBuffer(buf);
@@ -196,6 +207,7 @@ function tryDequeue() {
 }
 
 async function appendAvailableChunks(ls) {
+  if (!mseReady || !mse || mse.readyState !== 'open' || !sourceBuffer) return;
   if (els.video.error) { handleMediaError(); return; }
   const cur = room.roomState.livestream; // latest
   if (!cur || cur.mode !== 'chunk' || !cur.chunks) return;
@@ -225,10 +237,15 @@ function handleMediaError() {
   logDiag(`Video error (${code}). Resetting live buffer…`);
   const ls = getLivestream();
   if (!ls || ls.mode !== 'chunk') return;
+  const now = Date.now();
+  // simple backoff to prevent thrash
+  if (now - lastMSEErrorAt < 1000) return;
+  lastMSEErrorAt = now;
   const resumeFrom = (ls.latestSeq || 0);
   teardownMSE();
   expectSeq = resumeFrom;
-  ensureMSE(ls);
+  // give the element a moment to clear its error state
+  setTimeout(() => ensureMSE(ls), 250);
 }
 
 // Sync local video element to room state
@@ -520,9 +537,11 @@ els.video.addEventListener('play', () => {
   const ls = getLivestream();
   if (!ls) return;
   if (ls.mode === 'chunk') {
-    // In chunk mode, play/pause is driven by recorder; reflect paused=false
-    room.updateRoomState({ livestream: { ...ls, paused: false } });
-    logDiag('Host: play (chunk mode)');
+    // Only update if state is actually paused to avoid loops
+    if (ls.paused) {
+      room.updateRoomState({ livestream: { ...ls, paused: false } });
+      logDiag('Host: play (chunk mode)');
+    }
     return;
   }
   const now = Date.now();
