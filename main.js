@@ -30,6 +30,16 @@ const state = {
   lastAppliedFromState: 0, // last time we applied a sync from room.state (ms)
 };
 
+/* add MSE/chunking runtime state */
+let mse = null;
+let sourceBuffer = null;
+let mseReady = false;
+let expectSeq = 0;
+let appendQueue = [];
+let appending = false;
+let chunkPollTimer = null;
+let chunkModeInitialized = false;
+
 function getLivestream() {
   return room.roomState.livestream || null;
 }
@@ -120,19 +130,102 @@ async function ensureVideoSrc(url) {
   }
 }
 
+// MSE helpers for chunked streaming
+function teardownMSE() {
+  try { if (els.video) els.video.pause(); } catch {}
+  if (mse) {
+    try { mse.endOfStream(); } catch {}
+  }
+  mse = null;
+  sourceBuffer = null;
+  mseReady = false;
+  expectSeq = 0;
+  appendQueue = [];
+  appending = false;
+  if (chunkPollTimer) {
+    clearInterval(chunkPollTimer);
+    chunkPollTimer = null;
+  }
+  chunkModeInitialized = false;
+}
+
+function ensureMSE(ls) {
+  if (chunkModeInitialized) return;
+  teardownMSE(); // reset before init
+  mse = new MediaSource();
+  els.video.src = URL.createObjectURL(mse);
+  mse.addEventListener('sourceopen', () => {
+    try {
+      sourceBuffer = mse.addSourceBuffer(ls.mime || 'video/webm; codecs=vp8,opus');
+      sourceBuffer.mode = 'segments';
+      sourceBuffer.addEventListener('updateend', tryDequeue);
+      mseReady = true;
+      // Start polling room state for new chunks
+      chunkPollTimer = setInterval(() => appendAvailableChunks(ls), 500);
+    } catch (e) {
+      logDiag('MSE init failed. ' + e.message);
+    }
+  });
+  chunkModeInitialized = true;
+}
+
+async function fetchChunk(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('chunk fetch failed');
+  return await res.arrayBuffer();
+}
+
+function queueAppend(buf) {
+  appendQueue.push(buf);
+  tryDequeue();
+}
+
+function tryDequeue() {
+  if (!sourceBuffer || sourceBuffer.updating || !appendQueue.length) return;
+  const buf = appendQueue.shift();
+  try {
+    sourceBuffer.appendBuffer(buf);
+  } catch (e) {
+    logDiag('appendBuffer error: ' + e.message);
+  }
+}
+
+async function appendAvailableChunks(ls) {
+  const cur = room.roomState.livestream; // latest
+  if (!cur || cur.mode !== 'chunk' || !cur.chunks) return;
+  // append in order while next seq exists
+  while (cur.chunks[String(expectSeq)]) {
+    const meta = cur.chunks[String(expectSeq)];
+    try {
+      const ab = await fetchChunk(meta.url);
+      queueAppend(ab);
+      expectSeq++;
+      if (els.video.paused && !ls.paused) {
+        els.video.play().catch(() => {
+          els.joinOverlay.classList.remove('hidden');
+        });
+      }
+    } catch (e) {
+      logDiag(`chunk ${expectSeq} fetch failed, retrying later`);
+      break;
+    }
+  }
+}
+
 // Sync local video element to room state
 async function syncPlayback(toState = true) {
   const ls = getLivestream();
   const haveSrc = !!els.video.src;
   const url = ls && ls.url;
 
-  if (!ls || !url) {
+  if (!ls || (!url && ls.mode !== 'chunk')) {
     els.video.removeAttribute('src');
     els.video.load();
     els.liveBadge.textContent = 'OFF AIR';
     els.streamTitle.textContent = 'No stream active';
     els.hostInfo.textContent = 'Host: —';
     setViewerControls();
+    teardownMSE();
     return;
   }
 
@@ -142,17 +235,29 @@ async function syncPlayback(toState = true) {
   els.hostInfo.textContent = `Host: ${hostPeer ? hostPeer.username : 'Unknown'}`;
   els.liveBadge.textContent = ls.paused ? 'PAUSED' : 'LIVE';
 
-  // Ensure the source is set
-  await ensureVideoSrc(url);
-
-  // Only host is allowed to control
+  // Only host is allowed to control (disabled in chunk mode)
   state.isHost = isYouHost();
   if (state.isHost) {
-    setHostControlsEnabled(true);
+    setHostControlsEnabled(ls.mode !== 'chunk'); // disable native controls in chunk mode POC
   } else {
     setHostControlsEnabled(false);
     setViewerControls();
   }
+
+  if (ls.mode === 'chunk') {
+    ensureMSE(ls);
+    // autoplay attempt
+    if (!ls.paused && els.video.paused) {
+      els.video.play().then(() => els.joinOverlay.classList.add('hidden')).catch(() => els.joinOverlay.classList.remove('hidden'));
+    } else if (ls.paused && !els.video.paused) {
+      els.video.pause();
+    }
+    state.lastAppliedFromState = ms();
+    return;
+  }
+
+  // File URL mode (original)
+  await ensureVideoSrc(url);
 
   const targetT = computeLiveCurrentTime(ls);
   const drift = Math.abs((els.video.currentTime || 0) - targetT);
@@ -203,8 +308,8 @@ async function becomeHostWithFile(file) {
   try {
     url = await window.websim.upload(file);
   } catch (e) {
-    logDiag('Upload failed.');
-    alert('Upload failed. Please try again.');
+    logDiag('Upload failed. Switching to chunked live mode.');
+    await startChunkedLivestream(file);
     els.goLiveBtn.disabled = false;
     return;
   }
@@ -272,7 +377,98 @@ function endStream() {
   if (!ok) return;
   room.updateRoomState({ livestream: null });
   room.updatePresence({ role: 'viewer', ts: Date.now() });
+  teardownMSE();
   syncPlayback(true);
+}
+
+// Chunked livestream: record local file to webm chunks and upload incrementally
+async function startChunkedLivestream(file) {
+  // Create offscreen video to feed MediaRecorder
+  const off = document.createElement('video');
+  off.muted = true;
+  off.playsInline = true;
+  off.src = URL.createObjectURL(file);
+  await off.play().catch(() => {});
+  const stream = off.captureStream ? off.captureStream(30) : off.mozCaptureStream?.() ;
+  if (!stream) {
+    alert('Your browser does not support captureStream for chunked streaming.');
+    return;
+  }
+
+  // Choose a supported mime for recorder and MSE
+  const candidates = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm'
+  ];
+  let mime = '';
+  for (const c of candidates) {
+    if (MediaRecorder.isTypeSupported(c)) { mime = c; break; }
+  }
+  if (!mime) {
+    alert('No supported recording codec found.');
+    return;
+  }
+
+  // Initialize room state in chunk mode
+  const liveState = {
+    mode: 'chunk',
+    hostId: room.clientId,
+    title: file.name || 'Live',
+    startedAt: Date.now(),
+    paused: false,
+    mime,
+    chunks: {}, // object map of seq -> { url }
+    latestSeq: 0
+  };
+  room.updateRoomState({ livestream: liveState });
+  room.updatePresence({ role: 'host', ts: Date.now() });
+
+  // Setup MSE playback for host's main player
+  ensureMSE(liveState);
+  els.joinOverlay.classList.add('hidden');
+
+  // Start recorder
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 1_500_000, audioBitsPerSecond: 96_000 });
+  let seq = 0;
+  rec.ondataavailable = async (e) => {
+    if (!e.data || e.data.size === 0) return;
+    try {
+      const url = await window.websim.upload(e.data);
+      // Update room state with new chunk
+      room.updateRoomState({
+        livestream: {
+          chunks: { [String(seq)]: { url } },
+          latestSeq: seq
+        }
+      });
+      // For host playback, append immediately
+      try {
+        const ab = await e.data.arrayBuffer();
+        queueAppend(ab);
+      } catch {}
+      seq++;
+    } catch (err) {
+      logDiag('Chunk upload failed, will continue and retry next chunks.');
+    }
+  };
+  rec.onerror = (ev) => logDiag('Recorder error: ' + ev.error?.name || 'unknown');
+  rec.start(1000); // 1s chunks
+
+  // Keep offscreen video advancing; sync pause/resume from room state
+  const unsub = room.subscribeRoomState((rs) => {
+    const ls = getLivestream();
+    if (!ls || ls.mode !== 'chunk') return;
+    if (ls.paused && !off.paused) off.pause();
+    if (!ls.paused && off.paused) off.play().catch(() => {});
+  });
+
+  // Clean up when file ends
+  off.addEventListener('ended', () => {
+    try { rec.stop(); } catch {}
+    unsub();
+    logDiag('Source ended.');
+  });
 }
 
 // Wire UI
@@ -304,6 +500,12 @@ els.video.addEventListener('play', () => {
   if (!isYouHost()) return;
   const ls = getLivestream();
   if (!ls) return;
+  if (ls.mode === 'chunk') {
+    // In chunk mode, play/pause is driven by recorder; reflect paused=false
+    room.updateRoomState({ livestream: { ...ls, paused: false } });
+    logDiag('Host: play (chunk mode)');
+    return;
+  }
   const now = Date.now();
   const newStartedAt = now - Math.floor(els.video.currentTime * 1000);
   room.updateRoomState({
@@ -323,6 +525,11 @@ els.video.addEventListener('pause', () => {
   if (!isYouHost()) return;
   const ls = getLivestream();
   if (!ls) return;
+  if (ls.mode === 'chunk') {
+    room.updateRoomState({ livestream: { ...ls, paused: true } });
+    logDiag('Host: pause (chunk mode)');
+    return;
+  }
   const now = Date.now();
   const newStartedAt = now - Math.floor(els.video.currentTime * 1000);
   room.updateRoomState({
@@ -354,6 +561,11 @@ els.video.addEventListener('seeked', () => {
   }
   const ls = getLivestream();
   if (!ls) return;
+  if (ls.mode === 'chunk') {
+    // Seeking not supported in chunk mode POC
+    logDiag('Seek ignored in chunk mode');
+    return;
+  }
   const now = Date.now();
   const newStartedAt = now - Math.floor(els.video.currentTime * 1000);
   room.updateRoomState({
@@ -371,7 +583,17 @@ els.video.addEventListener('seeked', () => {
 setInterval(() => {
   const ls = getLivestream();
   if (!ls) return;
-  if (isYouHost()) return; // host is source of truth
+  if (ls.mode === 'chunk') {
+    // Ensure play/pause matches for chunk mode
+    if (!isYouHost()) {
+      if (!ls.paused && els.video.paused) {
+        els.video.play().catch(() => els.joinOverlay.classList.remove('hidden'));
+      } else if (ls.paused && !els.video.paused) {
+        els.video.pause();
+      }
+    }
+    return;
+  }
   const targetT = computeLiveCurrentTime(ls);
   const drift = (els.video.currentTime || 0) - targetT;
   if (Math.abs(drift) > 0.4) {
@@ -391,4 +613,3 @@ setInterval(() => {
 // Initial UI state
 els.roomStatus.textContent = 'Connected';
 refreshFromRoomState();
-
