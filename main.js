@@ -97,6 +97,7 @@ room.onmessage = (event) => {
       break;
   }
 };
+els.video.addEventListener('error', handleMediaError);
 
 function logDiag(msg) {
   const now = new Date().toLocaleTimeString();
@@ -147,6 +148,7 @@ function teardownMSE() {
     chunkPollTimer = null;
   }
   chunkModeInitialized = false;
+  try { els.video.removeAttribute('src'); els.video.load(); } catch {}
 }
 
 function ensureMSE(ls) {
@@ -157,8 +159,10 @@ function ensureMSE(ls) {
   mse.addEventListener('sourceopen', () => {
     try {
       sourceBuffer = mse.addSourceBuffer(ls.mime || 'video/webm; codecs=vp8,opus');
+      mse.duration = Infinity;
       sourceBuffer.mode = 'segments';
       sourceBuffer.addEventListener('updateend', tryDequeue);
+      sourceBuffer.addEventListener('error', () => handleMediaError());
       mseReady = true;
       // Start polling room state for new chunks
       chunkPollTimer = setInterval(() => appendAvailableChunks(ls), 500);
@@ -187,10 +191,12 @@ function tryDequeue() {
     sourceBuffer.appendBuffer(buf);
   } catch (e) {
     logDiag('appendBuffer error: ' + e.message);
+    handleMediaError();
   }
 }
 
 async function appendAvailableChunks(ls) {
+  if (els.video.error) { handleMediaError(); return; }
   const cur = room.roomState.livestream; // latest
   if (!cur || cur.mode !== 'chunk' || !cur.chunks) return;
   // append in order while next seq exists
@@ -210,6 +216,19 @@ async function appendAvailableChunks(ls) {
       break;
     }
   }
+}
+
+function handleMediaError() {
+  const err = els.video.error;
+  if (!err) return;
+  const code = err.code; // 1:ABORTED 2:NETWORK 3:DECODE 4:SRC_NOT_SUPPORTED
+  logDiag(`Video error (${code}). Resetting live buffer…`);
+  const ls = getLivestream();
+  if (!ls || ls.mode !== 'chunk') return;
+  const resumeFrom = (ls.latestSeq || 0);
+  teardownMSE();
+  expectSeq = resumeFrom;
+  ensureMSE(ls);
 }
 
 // Sync local video element to room state
@@ -587,7 +606,9 @@ setInterval(() => {
     // Ensure play/pause matches for chunk mode
     if (!isYouHost()) {
       if (!ls.paused && els.video.paused) {
-        els.video.play().catch(() => els.joinOverlay.classList.remove('hidden'));
+        els.video.play().catch(() => {
+          els.joinOverlay.classList.remove('hidden');
+        });
       } else if (ls.paused && !els.video.paused) {
         els.video.pause();
       }
