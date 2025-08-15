@@ -27,6 +27,9 @@ const els = {
 
 const room = new WebsimSocket(); // Provided globally
 await room.initialize();
+/* ensure autoplay-friendly defaults */
+els.video.muted = true;
+els.video.playsInline = true;
 
 const state = {
   isHost: false,
@@ -601,10 +604,12 @@ function renderChatMessage(clientId, text, ts) {
 
 async function startScreenLivestream() {
   try {
-    const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: 30, width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: true
-    });
+    const stream = await getScreenStream();
+    if (!stream) {
+      logDiag('Failed to start tab broadcast: screen capture not available.');
+      alert('This browser does not support screen capture. Try Chrome or Edge on desktop.');
+      return;
+    }
     // If no audio track, try to grab mic and add
     if (!stream.getAudioTracks().length) {
       try {
@@ -682,6 +687,28 @@ async function startScreenLivestream() {
   }
 }
 
+// Helpers
+async function getScreenStream() {
+  try {
+    if (navigator.mediaDevices?.getDisplayMedia) {
+      return await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 30, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: true
+      });
+    }
+    if (navigator.getDisplayMedia) {
+      return await navigator.getDisplayMedia({ video: true, audio: true });
+    }
+    // Firefox fallback
+    if (navigator.mediaDevices?.getUserMedia) {
+      return await navigator.mediaDevices.getUserMedia({ video: { mediaSource: 'screen' }, audio: true });
+    }
+  } catch (e) {
+    logDiag('getScreenStream error: ' + e.message);
+  }
+  return null;
+}
+
 // Wire UI
 els.goLiveBtn.addEventListener('click', async () => {
   const file = els.fileInput.files && els.fileInput.files[0];
@@ -691,6 +718,12 @@ els.goLiveBtn.addEventListener('click', async () => {
 els.startTabBtn.addEventListener('click', () => {
   startScreenLivestream();
 });
+/* feature-detect screen share and disable if unsupported */
+if (!(navigator.mediaDevices && (navigator.mediaDevices.getDisplayMedia || navigator.getDisplayMedia))) {
+  els.startTabBtn.disabled = true;
+  els.startTabBtn.title = 'Screen sharing is not supported in this browser.';
+  logDiag('Screen share unavailable: getDisplayMedia not supported.');
+}
 
 els.takeHostBtn.addEventListener('click', () => {
   takeHost();
@@ -704,6 +737,7 @@ els.endBtn.addEventListener('click', () => {
 els.joinBtn.addEventListener('click', async () => {
   // Attempt to play again
   try {
+    els.video.muted = false;
     await els.video.play();
     els.joinOverlay.classList.add('hidden');
   } catch {
