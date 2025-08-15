@@ -168,6 +168,17 @@ button.danger {
 .mono { font-family: "Space Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
 .small { font-size: 12px; color: var(--muted); word-break: break-word; }
 
+.you-profile { display: inline-flex; gap: 8px; align-items: center; }
+.you-profile img { width: 20px; height: 20px; border-radius: 50%; object-fit: cover; border: 1px solid var(--border); }
+
+.chat { height: 240px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 8px; background: var(--surface); }
+.chat .msg { display: grid; grid-template-columns: 26px 1fr; gap: 8px; margin-bottom: 8px; }
+.chat .avatar { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; border: 1px solid var(--border); }
+.chat .bubble { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 6px 8px; }
+.chat .bubble .meta { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+.chat-input { display: flex; gap: 8px; margin-top: 8px; }
+.chat-input input { flex: 1; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--fg); }
+
 @media (max-width: 980px) {
   .wrap { grid-template-columns: 1fr; }
 }

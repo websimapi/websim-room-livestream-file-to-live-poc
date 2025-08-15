@@ -10,6 +10,7 @@ const els = {
   joinBtn: document.getElementById('joinBtn'),
   fileInput: document.getElementById('fileInput'),
   goLiveBtn: document.getElementById('goLiveBtn'),
+  startTabBtn: document.getElementById('startTabBtn'),
   takeHostBtn: document.getElementById('takeHostBtn'),
   endBtn: document.getElementById('endBtn'),
   streamTitle: document.getElementById('streamTitle'),
@@ -17,6 +18,11 @@ const els = {
   roomStatus: document.getElementById('roomStatus'),
   youLabel: document.getElementById('youLabel'),
   diag: document.getElementById('diag'),
+  chatLog: document.getElementById('chatLog'),
+  chatText: document.getElementById('chatText'),
+  chatSend: document.getElementById('chatSend'),
+  youAvatar: document.getElementById('youAvatar'),
+  youName: document.getElementById('youName'),
 };
 
 const room = new WebsimSocket(); // Provided globally
@@ -86,6 +92,10 @@ room.subscribePresence(() => {
   els.peers.textContent = `${list.length} online: ${list.join(', ')}`;
   const me = room.peers[room.clientId];
   els.youLabel.textContent = me ? me.username : '—';
+  if (me) {
+    els.youName.textContent = me.username;
+    els.youAvatar.src = me.avatarUrl || '';
+  }
 });
 
 // Room state listener
@@ -100,6 +110,9 @@ room.onmessage = (event) => {
     case 'connected':
     case 'disconnected':
       // Presence subscription above keeps UI updated
+      break;
+    case 'chat':
+      renderChatMessage(d.clientId, d.text, d.ts);
       break;
     default:
       // console.log('Event:', d);
@@ -565,10 +578,118 @@ async function startChunkedLivestream(file) {
   });
 }
 
+function renderChatMessage(clientId, text, ts) {
+  const who = room.peers[clientId] || {};
+  const name = who.username || 'Guest';
+  const avatar = who.avatarUrl || '';
+  const time = ts ? new Date(ts).toLocaleTimeString() : '';
+  const wrap = document.createElement('div');
+  wrap.className = 'msg';
+  const img = document.createElement('img');
+  img.className = 'avatar';
+  img.src = avatar;
+  img.alt = name;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.innerHTML = `<div class="meta">${name} • ${time}</div><div class="text"></div>`;
+  bubble.querySelector('.text').textContent = text;
+  wrap.appendChild(img);
+  wrap.appendChild(bubble);
+  els.chatLog.appendChild(wrap);
+  els.chatLog.scrollTop = els.chatLog.scrollHeight;
+}
+
+async function startScreenLivestream() {
+  try {
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 30, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: true
+    });
+    // If no audio track, try to grab mic and add
+    if (!stream.getAudioTracks().length) {
+      try {
+        const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mic.getAudioTracks().forEach(t => stream.addTrack(t));
+      } catch {}
+    }
+    // Choose recorder mime
+    const candidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm'
+    ];
+    let mime = '';
+    for (const c of candidates) {
+      if (MediaRecorder.isTypeSupported(c)) { mime = c; break; }
+    }
+    if (!mime) {
+      alert('No supported recording codec found.');
+      return;
+    }
+    const liveState = {
+      mode: 'chunk',
+      hostId: room.clientId,
+      title: 'Tab Broadcast',
+      startedAt: Date.now(),
+      paused: false,
+      mime,
+      chunks: {},
+      latestSeq: 0
+    };
+    room.updateRoomState({ livestream: liveState });
+    room.updatePresence({ role: 'host', ts: Date.now() });
+    ensureMSE(liveState);
+    els.joinOverlay.classList.add('hidden');
+
+    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 2_000_000, audioBitsPerSecond: 128_000 });
+    let seq = 0;
+    rec.ondataavailable = async (e) => {
+      if (!e.data || e.data.size === 0) return;
+      try {
+        const url = await window.websim.upload(e.data);
+        room.updateRoomState({
+          livestream: {
+            chunks: { [String(seq)]: { url } },
+            latestSeq: seq
+          }
+        });
+        try { queueAppend(await e.data.arrayBuffer()); } catch {}
+        seq++;
+      } catch (err) {
+        logDiag('Chunk upload failed during tab cast.');
+      }
+    };
+    rec.onerror = (ev) => logDiag('Recorder error (tab): ' + (ev.error?.name || 'unknown'));
+    rec.start(1000);
+
+    // Stop handling
+    const stopAll = () => {
+      try { rec.stop(); } catch {}
+      stream.getTracks().forEach(t => t.stop());
+    };
+    screenRecController.stop = stopAll;
+    screenRecController.stream = stream;
+
+    // If user stops share from browser UI
+    stream.getVideoTracks().forEach(t => {
+      t.addEventListener('ended', () => {
+        stopAll();
+        logDiag('Tab share ended.');
+      });
+    });
+  } catch (e) {
+    logDiag('Failed to start tab broadcast: ' + e.message);
+  }
+}
+
 // Wire UI
 els.goLiveBtn.addEventListener('click', async () => {
   const file = els.fileInput.files && els.fileInput.files[0];
   await becomeHostWithFile(file);
+});
+
+els.startTabBtn.addEventListener('click', () => {
+  startScreenLivestream();
 });
 
 els.takeHostBtn.addEventListener('click', () => {
@@ -576,6 +697,7 @@ els.takeHostBtn.addEventListener('click', () => {
 });
 
 els.endBtn.addEventListener('click', () => {
+  screenRecController.stop?.();
   endStream();
 });
 
@@ -587,6 +709,16 @@ els.joinBtn.addEventListener('click', async () => {
   } catch {
     // ignored
   }
+});
+
+els.chatSend.addEventListener('click', () => {
+  const text = (els.chatText.value || '').trim();
+  if (!text) return;
+  els.chatText.value = '';
+  room.send({ type: 'chat', text, ts: Date.now() });
+});
+els.chatText.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.chatSend.click();
 });
 
 // Host control hooks: reflect play/pause/seek to room state
